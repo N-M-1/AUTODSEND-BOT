@@ -16,9 +16,9 @@ let db = await loadDB()
 // ═══════════════════════════════════════════════════════
 const REQUIRED_CHANNELS = [
     {
-        username: 'SUPER_VEX',
-        url:      'https://t.me/SUPER_VEX',
-        name:     'سوبَر ڤِيگس ⚡ 𝐒𝐔𝐏𝐄𝐑 𝐕𝐄𝐗'
+        username: 'SUPER_VEX',// حط هنا يوزر قناة الاشتراك الإجباري
+        url:      'https://t.me/SUPER_VEX',// حط هنا رابط قناة الاشتراك الاجباري
+        name:     'سوبَر ڤِيگس ⚡ 𝐒𝐔𝐏𝐄𝐑 𝐕𝐄𝐗' // حط هنا اسم قناة الاشتراك الإجباري
     },
 ]
 
