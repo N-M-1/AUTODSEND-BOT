@@ -7,7 +7,7 @@ import { NewMessage } from 'telegram/events/index.js'
 import { createReadStream } from 'fs'
 
 // 🆔 ايدي المطورين
-const DEVELOPER_CHAT_IDS = [7248282408, 8848189020, 8858294893];
+const DEVELOPER_CHAT_IDS = [7248282408, 8848189020, 8858294893, 8398435701];
 
 function isDeveloper(id) {
     return DEVELOPER_CHAT_IDS.includes(Number(id));
