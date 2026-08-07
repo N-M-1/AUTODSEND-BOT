@@ -7,7 +7,7 @@ import { NewMessage } from 'telegram/events/index.js'
 import { createReadStream } from 'fs'
 
 // 🆔 ايدي المطور
-const DEVELOPER_CHAT_ID = ["7248282408","8858294893"];
+const DEVELOPER_CHAT_ID = 7248282408;
 
 let db = await loadDB()
 
